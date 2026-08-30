@@ -1,0 +1,8 @@
+spring:
+  application:
+    name: merchant-service
+
+  config:
+    import: configserver:http://localhost:8888
+
+

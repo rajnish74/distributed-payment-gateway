@@ -1,0 +1,6 @@
+com.rajnish.razorpay.audit.SharedAuditAutoConfiguration
+com.rajnish.razorpay.config.SharedKafkaAutoConfiguration
+com.rajnish.razorpay.idempotency.SharedResilienceAutoConfigurations
+com.rajnish.razorpay.exceptions.SharedExceptionAutoConfiguration
+com.rajnish.razorpay.utils.SharedSecurityAutoConfiguration
+com.rajnish.razorpay.web.SharedWebFilterAutoConfiguration
