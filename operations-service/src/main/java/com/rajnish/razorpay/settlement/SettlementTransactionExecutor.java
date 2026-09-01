@@ -38,14 +38,13 @@ public class SettlementTransactionExecutor {
     private final SettlementPaymentRepository settlementPaymentRepository;
     private final BankTransferProcessor bankTransferProcessor;
     private final OutboxEventPublisher outboxEventPublisher;
-    private final PaymentServiceClient  paymentServiceClient;
-    private final MerchantServiceClient  merchantServiceClient;
+    private final SettlementIntegrationGateway settlementIntegrationGateway;
     private static final double FEE_RATE = 0.02;
     private static final double GST_RATE = 0.18;
 
     @Transactional
     public void processForMerchant(UUID merchantId, LocalDate settlementDate) {
-        List<PaymentSettlementView> unsettledPayments = paymentServiceClient.findUnSettledCaptured(merchantId);
+        List<PaymentSettlementView> unsettledPayments = settlementIntegrationGateway.findUnSettledCaptured(merchantId);
         if (unsettledPayments.isEmpty()) return;
 
         log.info("Processing {} unsettled payments for merchantId: {} on {} date",
@@ -87,7 +86,7 @@ public class SettlementTransactionExecutor {
             settlementPaymentRepository.saveAll(links);
 
 
-            SettlementBankDetails settlementBankDetails = merchantServiceClient.getSettlementBankDetails(merchantId);
+            SettlementBankDetails settlementBankDetails = settlementIntegrationGateway.getSettlementBankDetails(merchantId);
             BankTransferResult bankTransferResult = bankTransferProcessor.initiate(
                     settlement.getId(),
                     merchantId,
@@ -129,7 +128,7 @@ public class SettlementTransactionExecutor {
                                     .map(SettlementPaymentId::getPaymentId)
                                             .toList();
 
-            paymentServiceClient.markSettled(paymentIds);
+            settlementIntegrationGateway.markSettled(paymentIds);
 
 
             log.info("Settlement resolved, successfully settled for id: {}", settlement.getId());

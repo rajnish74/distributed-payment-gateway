@@ -7,6 +7,7 @@ import com.rajnish.razorpay.repository.SettlementRepository;
 import com.rajnish.razorpay.utils.RandomizerUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -21,6 +22,7 @@ public class BankSettlementCallbackSimulator {
     private final SettlementTransactionExecutor  settlementTransactionExecutor;
 
     @Scheduled(fixedDelayString = "5000")
+    @SchedulerLock(name = "opeartions-service-bank-settlement-simulator", lockAtMostFor = "10s", lockAtLeastFor = "1s")
     public void processCallbacks(){
         List<Settlement> settlements = settlementRepository.findByStatus(SettlementStatus.TRANSFER_PENDING);
         if(settlements.isEmpty()) return;

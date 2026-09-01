@@ -19,6 +19,8 @@ import com.rajnish.razorpay.outbox.OutboxEventPublisher;
 import com.rajnish.razorpay.repositories.OrderRepository;
 import com.rajnish.razorpay.repositories.PaymentRepository;
 import com.rajnish.razorpay.service.OrderService;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -48,6 +50,8 @@ public class OrderServiceImpl implements OrderService {
 
     @Override
     @Transactional
+    @CircuitBreaker(name = "merchant-service")
+    @Retry(name = "merchant-service ")
     public OrderResponse createOrder(UUID merchantId, CreateOrderRequest request) {
         if (request.receipt() != null && orderRepository.existsByMerchantIdAndReceipt(merchantId,request.receipt())){
             throw new DuplicateResourceException("DUPLICATE_ORDER_RECEIPT","Order with receipt already exists : "+request.receipt());

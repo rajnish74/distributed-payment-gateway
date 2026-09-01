@@ -9,6 +9,8 @@ import com.rajnish.razorpay.service.PaymentService;
 import com.rajnish.razorpay.utils.RandomizerUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -23,7 +25,8 @@ public class BankCallbackSimulator {
     private final PaymentService paymentService;
     private final SimulatorConfig simulatorConfig;
 
-//    @Scheduled(fixedDelayString = "${payment.simulator.poll-interval-ms:5000}")
+    @Scheduled(fixedDelayString = "${payment.simulator.poll-interval-ms:5000}")
+    @SchedulerLock(name = "payment-service-bank-callback-simulator", lockAtMostFor = "10s", lockAtLeastFor = "1s")
     public void processCallbacks(){
         LocalDateTime globalWindow=LocalDateTime.now().minusSeconds(1);
 
