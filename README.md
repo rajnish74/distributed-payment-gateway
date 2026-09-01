@@ -209,7 +209,7 @@ Full reasoning: [docs/design-decisions.md](docs/design-decisions.md)
 
 ## Related
 
-**v1 — Monolith:** https://github.com/rajnish74/razorpay
+**v1 — Monolith:** https://github.com/rajnish74/Payment-Gateway-Integrations-System
 
 The same domain built as a single Spring Boot application first. The monolith is complete and fully working. This repo is the microservices rewrite.
 
