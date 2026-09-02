@@ -22,7 +22,7 @@ Inspired by Razorpay's architecture — built from scratch to understand how rea
 
 ## Overview
 
-This is the microservices rewrite of a [monolith payment gateway](https://github.com/rajnish74/razorpay) I built earlier. The rewrite wasn't just architecture for architecture's sake — the settlement engine (nightly batch), webhook delivery (retry queue, async HTTP), and real-time payment processing have fundamentally different scaling and failure characteristics. Splitting them means they fail independently and scale independently.
+This is the microservices rewrite of a [monolith payment gateway](https://github.com/rajnish74/Payment-Gateway-Integrations-System) I built earlier. The rewrite wasn't just architecture for architecture's sake — the settlement engine (nightly batch), webhook delivery (retry queue, async HTTP), and real-time payment processing have fundamentally different scaling and failure characteristics. Splitting them means they fail independently and scale independently.
 
 **What it implements:**
 - Complete payment lifecycle — merchant onboarding → order → payment → capture → settlement
