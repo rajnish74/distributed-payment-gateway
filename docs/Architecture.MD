@@ -4,101 +4,289 @@
 
 Seven independent Spring Boot services, each with its own PostgreSQL database. Services communicate synchronously via OpenFeign and asynchronously via Kafka. A centralized config server pulls configuration from a private GitHub repo. Eureka handles service discovery — Feign clients resolve service names through it instead of hardcoded URLs.
 
-The domain split follows bounded contexts: merchant identity, payment processing, card vault, and operations (settlement + webhook delivery). Each boundary is enforced — no service queries another's database directly.
+The domain split follows four bounded contexts: **merchant identity**, **payment processing**, **card vault**, and **operations** (settlement + webhook delivery). Each boundary is enforced at the code level — no service queries another's database directly.
 
 ---
 
 ## Service Map
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Config Server :8888                   │
-│           ← GitHub: distributed-payment-gateway-config  │
-└─────────────────────┬───────────────────────────────────┘
-                      │  all services bootstrap here
-┌─────────────────────▼───────────────────────────────────┐
-│                  Eureka Discovery :8761                  │
-│              all services register here                  │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-         Client ──────▼──────
-                API Gateway :8010
-                      │
-         ┌────────────┼────────────┬──────────────┐
-         ▼            ▼            ▼              ▼
-   merchant-svc  payment-svc  vault-svc   operations-svc
-     :9010         :9020        :9030         :9040
-         │            │                         │
-         DB           DB            DB          DB
-   merchant-db  payment-db    vault-db   operations-db
+┌─────────────────────────────────────────────────────────────┐
+│                    Config Server :8888                       │
+│         ← GitHub: distributed-payment-gateway-config        │
+└──────────────────────┬──────────────────────────────────────┘
+                       │  all services bootstrap here
+┌──────────────────────▼──────────────────────────────────────┐
+│                  Eureka Discovery :8761                      │
+│              all services register here                      │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+          Client ──────▼──────────────
+                 API Gateway :8010
+                       │
+          ┌────────────┼────────────┬──────────────┐
+          ▼            ▼            ▼              ▼
+    merchant-svc  payment-svc  vault-svc   operations-svc
+      :9010         :9020        :9030         :9040
+          │            │            │              │
+        (DB)         (DB)         (DB)           (DB)
+  merchant-db   payment-db   vault-db    operations-db
 ```
 
 ---
 
 ## Startup Order
 
+Services must start in this exact order:
+
 ```
-1. config-service     (8888)  ← must be first
-2. discovery-service  (8761)  ← needs config server
+1. config-service     (8888)  ← must be first — others won't start without it
+2. discovery-service  (8761)  ← Eureka must be up before services register
 3. merchant-service   (9010)  ─┐
-4. payment-service    (9020)   ├─ need config + Eureka
+4. payment-service    (9020)   ├─ any order after Eureka is ready
 5. vault-service      (9030)   │
 6. operations-service (9040)  ─┘
-7. api-gateway-service (8010) ← last, after all services registered
+7. api-gateway-service (8010) ← last, after all services are in Eureka
 ```
 
 ---
 
 ## Request Flow
 
-### Merchant route (JWT auth)
+### Sequence Diagram — Payment Initiation
 
 ```
-Client → POST /v1/auth/login
-  ↓
-API Gateway
-  → JwtAuthHandler: no token needed for /login → pass through
-  ↓
-merchant-service
-  → authenticate credentials
-  → generate JWT (sub=email, merchant_id, role claims, HMAC-SHA256)
-  → return { accessToken }
-
-Client → GET /v1/merchants/api-keys
-  Authorization: Bearer <token>
-  ↓
-API Gateway
-  → JwtAuthHandler: verify token signature
-  → extract merchantId, role
-  → add X-Merchant-Id, X-Role headers
-  → forward to merchant-service
-  ↓
-merchant-service
-  → read X-Merchant-Id from header (trusts gateway)
-  → return API keys for that merchant
+Client          Gateway         payment-svc     vault-svc      Kafka
+  │                │                 │               │             │
+  │─POST /v1/payments──────────────► │               │             │
+  │                │                 │               │             │
+  │         GatewayAuthFilter        │               │             │
+  │         decode Basic Auth        │               │             │
+  │         Redis cache lookup       │               │             │
+  │         (cache miss)             │               │             │
+  │         Feign→merchant-svc       │               │             │
+  │         BCrypt verify            │               │             │
+  │         rate limit check         │               │             │
+  │         add X-Merchant-Id header │               │             │
+  │                │                 │               │             │
+  │                │─forward────────►│               │             │
+  │                │                 │               │             │
+  │                │            validate order       │             │
+  │                │            (pessimistic lock)   │             │
+  │                │                 │               │             │
+  │                │                 │─Feign charge─►│             │
+  │                │                 │               │             │
+  │                │                 │◄──token result─│             │
+  │                │                 │               │             │
+  │                │            create Payment       │             │
+  │                │            status=AUTHORIZING   │             │
+  │                │            save OutboxEvent     │             │
+  │                │            (same transaction)   │             │
+  │                │                 │               │             │
+  │◄─────201 Created────────────────│               │             │
+  │                │                 │               │             │
+  │           [5s later]             │               │             │
+  │                │            OutboxPoller         │             │
+  │                │            picks up event       │             │
+  │                │                 │──publish─────────────────►  │
+  │                │                 │               │      payments.events
 ```
 
-### Payment route (API Key auth)
+### Sequence Diagram — Gateway Auth
 
 ```
-Client → POST /v1/payments
-  Authorization: Basic base64(keyId:secret)
-  X-Idempotency-Key: unique-key-123
-  ↓
-API Gateway
-  → ApiKeyAuthHandler:
-      decode Base64 → split keyId:secret
-      Redis lookup: "apikey:{keyId}" (5min TTL)
-      cache miss → Feign → merchant-service GET /internal/api-keys/{keyId}
-      BCrypt verify secret
-      check rate limit (Redis Lua script, per keyId)
-      check idempotency key (Redis, per merchantId:idempotencyKey)
-  → add X-Merchant-Id, X-Key-Id headers
-  → forward to payment-service
-  ↓
-payment-service
-  → read merchantId from X-Merchant-Id header
-  → process payment
+Client               API Gateway              merchant-svc       Redis
+  │                       │                        │               │
+  │─Authorization: Basic──►│                        │               │
+  │                       │                        │               │
+  │              GatewayAuthFilter                 │               │
+  │              detect "Basic " prefix            │               │
+  │                       │                        │               │
+  │                       │──GET apikey:{keyId}────────────────────►│
+  │                       │                        │               │
+  │                       │◄──cache hit (5min TTL)──────────────────│
+  │                       │                        │               │
+  │              BCrypt.verify(secret, hash)       │               │
+  │              rate limit check (Lua)            │               │
+  │              add X-Merchant-Id header          │               │
+  │                       │                        │               │
+  │              [cache miss path]                 │               │
+  │                       │──Feign GET /internal/api-keys/{keyId}──►│
+  │                       │◄──ApiKeyCacheEntry──────────────────────│
+  │                       │──cache.put(keyId, entry, 5min)─────────►│
+```
+
+---
+
+## Gateway Auth — Actual Code
+
+The gateway has a single filter that handles both JWT and API Key auth:
+
+```java
+@Override
+protected void doFilterInternal(HttpServletRequest request,
+        HttpServletResponse response, FilterChain filterChain) {
+
+    if (publicRouteMatcher.isPublic(request.getRequestURI())) {
+        filterChain.doFilter(request, response);
+        return;
+    }
+
+    String authHeader = request.getHeader("Authorization");
+
+    Map<String, String> identityHeaders = Map.of();
+    if (authHeader.startsWith(BASIC_PREFIX)) {
+        identityHeaders = apikeyAuthHandler.authenticate(authHeader, response);
+    } else if (authHeader.startsWith(BEARER_PREFIX)) {
+        identityHeaders = jwtAuthHandler.authenticate(
+                authHeader.substring(BEARER_PREFIX.length()));
+    }
+
+    // Wrap request with identity headers — downstream services trust these
+    HeaderAugumentingRequestWrapper wrapped = new HeaderAugumentingRequestWrapper(request);
+    identityHeaders.forEach(wrapped::putHeader);
+
+    filterChain.doFilter(wrapped, response);
+}
+```
+
+Downstream services read `X-Merchant-Id` and `X-Key-Id` from the request headers — they don't re-authenticate. The gateway is the single point of truth for identity.
+
+---
+
+## Payment State Machine — Actual Code
+
+The state machine is a static immutable map. A `Transition` is a Java record of (currentState, event). If the combination doesn't exist in the map, the transition is rejected.
+
+```java
+private record Transition(PaymentStatus from, PaymentEvent event) {}
+
+private static final Map<Transition, PaymentStatus> TRANSITION = Map.ofEntries(
+    Map.entry(new Transition(CREATED,            AUTHORIZE_ATTEMPT),  AUTHORIZING),
+    Map.entry(new Transition(AUTHORIZING,        AUTHORIZE_SUCCESS),  AUTHORIZED),
+    Map.entry(new Transition(AUTHORIZING,        AUTHORIZE_FAILURE),  FAILED),
+    Map.entry(new Transition(AUTHORIZED,         CAPTURE_REQUEST),    CAPTURING),
+    Map.entry(new Transition(CAPTURING,          CAPTURE_SUCCESS),    CAPTURED),
+    Map.entry(new Transition(CAPTURING,          CAPTURE_FAILURE),    AUTHORIZED),
+    Map.entry(new Transition(CAPTURED,           REFUND_INIT),        PARTIALLY_REFUNDED),
+    Map.entry(new Transition(PARTIALLY_REFUNDED, REFUND_SUCCESS),     REFUNDED),
+    Map.entry(new Transition(CAPTURED,           REFUND_SUCCESS),     REFUNDED),
+    Map.entry(new Transition(CAPTURED,           SETTLE),             SETTLED),
+    Map.entry(new Transition(SETTLED,            REFUND_INIT),        PARTIALLY_REFUNDED),
+    Map.entry(new Transition(CREATED,            CANCEL),             CANCELLED),
+    Map.entry(new Transition(AUTHORIZING,        CANCEL),             CANCELLED),
+    Map.entry(new Transition(AUTHORIZED,         CAPTURE_TIMEOUT),    AUTH_EXPIRED)
+);
+
+public PaymentStatus transition(PaymentStatus current, PaymentEvent event) {
+    PaymentStatus next = TRANSITION.get(new Transition(current, event));
+    if (next == null) {
+        throw new InvalidStateTransitionException(current.name(), event.name());
+    }
+    return next;
+}
+```
+
+Every transition goes through `PaymentTransitionLogService.apply()` which persists a `PaymentTransitionLog` record with `fromStatus`, `toStatus`, `event`, `actor`, and `occurredAt`.
+
+---
+
+## Transactional Outbox — Actual Code
+
+The outbox pattern solves the dual-write problem. The event is saved to the DB in the same transaction as the business entity — before Kafka is involved at all.
+
+```java
+// OutboxPoller.java — runs every 5 seconds
+@Scheduled(fixedDelay = 5000)
+public void poll() {
+    List<OutboxEvent> pendingEvents = outboxEventRepository
+            .findByStatusOrderByCreatedAtAsc(OutboxStatus.PENDING);
+
+    for (OutboxEvent event : pendingEvents) {
+        try {
+            String topic = kafkaProperties.topicFor(event.getAggregateType());
+            String key = extractMerchantId(event.getPayload()); // merchant-keyed for ordering
+
+            Map<String, Object> envelope = Map.of(
+                    "eventType",     event.getEventType(),
+                    "aggregateType", event.getAggregateType().name(),
+                    "aggregateId",   event.getAggregateId().toString(),
+                    "data",          event.getPayload()
+            );
+
+            kafkaTemplate.send(topic, key, envelope)
+                    .get(5, TimeUnit.SECONDS); // synchronous with 5s timeout
+
+            outboxResultHandler.handleEventPublished(event);
+        } catch (Exception e) {
+            outboxResultHandler.handleEventFailed(event, e.getMessage());
+            // max 3 attempts → FAILED status
+        }
+    }
+}
+```
+
+---
+
+## Webhook Retry Queue — Actual Code
+
+Redis Sorted Set as a time-ordered delivery queue. Score = epoch milliseconds of `nextRetryAt`.
+
+```java
+// Enqueue a webhook event for delivery at a specific time
+public void enqueue(UUID webhookEventId, LocalDateTime retryAt) {
+    long score = retryAt.toInstant(ZoneOffset.UTC).toEpochMilli();
+    redisTemplate.opsForZSet().add(key, webhookEventId.toString(), score);
+}
+
+// Poll events that are due right now
+public Set<UUID> pollDue(int limit) {
+    long now = LocalDateTime.now().toInstant(ZoneOffset.UTC).toEpochMilli();
+
+    Set<ZSetOperations.TypedTuple<String>> due = redisTemplate
+            .opsForZSet().rangeByScoreWithScores(key, 0, now, 0, limit);
+
+    // Remove atomically before processing
+    due.forEach(tuple -> redisTemplate.opsForZSet().remove(key, tuple.getValue()));
+
+    return due.stream()
+            .map(tuple -> UUID.fromString(tuple.getValue()))
+            .collect(Collectors.toSet());
+}
+
+// Used by DB reconciler — no duplicate enqueue on crash recovery
+public void enqueueIfAbsent(UUID id, LocalDateTime nextRetryAt) {
+    redisTemplate.opsForZSet().addIfAbsent(key, id.toString(),
+            nextRetryAt.toInstant(ZoneOffset.UTC).toEpochMilli());
+}
+```
+
+---
+
+## Settlement Engine — Actual Code
+
+One virtual thread per merchant — I/O-bound DB and Feign calls, no thread pool sizing needed.
+
+```java
+@Scheduled(cron = "0 0 23 * * *") // every night at 11 PM
+public void runScheduled() {
+    run();
+}
+
+public void run() {
+    List<UUID> merchantIds = merchantServiceClient.listActiveMerchantIds();
+
+    try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+        List<Future<?>> futures = merchantIds.stream()
+                .map(merchantId -> executor.submit(() ->
+                        settlementTransactionExecutor.processForMerchant(merchantId, LocalDate.now())))
+                .toList();
+
+        for (Future<?> f : futures) {
+            f.get(); // wait for all merchants to complete
+        }
+    }
+}
 ```
 
 ---
@@ -112,147 +300,44 @@ payment-service
 | api-gateway | merchant-service | `GET /internal/api-keys/{keyId}` | API key lookup for auth |
 | payment-service | vault-service | `POST /internal/vault/charge` | Charge a tokenized card |
 | payment-service | merchant-service | `POST /internal/customers/find-or-create` | Customer upsert on order creation |
-| operations-service | merchant-service | `GET /internal/merchants/{id}/webhook-targets` | Active webhook configs for event |
+| operations-service | merchant-service | `GET /internal/merchants/{id}/webhook-targets` | Active webhook configs |
 | operations-service | merchant-service | `GET /internal/merchants/active-ids` | Active merchant IDs for settlement |
 | operations-service | merchant-service | `GET /internal/merchants/{id}/settlement-bank-details` | Bank account for transfer |
 | operations-service | payment-service | `GET /internal/payments/unsettled-captured` | Payments to settle |
-| operations-service | payment-service | `POST /internal/payments/mark-settled` | Mark payments settled after transfer |
+| operations-service | payment-service | `POST /internal/payments/mark-settled` | Mark payments settled |
 
-All Feign clients resolve service URLs through Eureka — no hardcoded ports.
+### Kafka Topics
 
-### Kafka (Async)
-
-```
-payment-service
-  └── OutboxPoller (@Scheduled 5s)
-        → publishes to:
-            payments.events
-            orders.events
-            refund.events
-            settlement.events
-
-operations-service
-  └── WebhookKafkaConsumer
-        → listens on all 4 topics
-        → manual ack (does not ack on exception)
-        → creates WebhookEvent per merchant target
-        → enqueues to Redis ZSet
-```
+| Topic | Publisher | Consumer |
+|---|---|---|
+| `payments.events` | payment-service OutboxPoller | operations-service WebhookKafkaConsumer |
+| `orders.events` | payment-service OutboxPoller | operations-service WebhookKafkaConsumer |
+| `refund.events` | payment-service OutboxPoller | operations-service WebhookKafkaConsumer |
+| `settlement.events` | operations-service OutboxPoller | operations-service WebhookKafkaConsumer |
 
 ---
 
-## Async Pipeline — Full Flow
+## Common Library Auto-Configurations
 
-```
-Payment captured in payment-service
-  ↓
-OutboxEventPublisher.publish()
-  → saves OutboxEvent (status=PENDING) in SAME DB transaction as payment
-  [atomicity guaranteed — no dual-write problem]
-  ↓
-OutboxPoller (runs every 5s)
-  → finds PENDING outbox events
-  → publishes to Kafka: { eventType, aggregateType, aggregateId, data }
-  → key = merchantId (ensures ordering per merchant)
-  → marks PUBLISHED on success
-  → increments attempt on failure (max 3 → FAILED)
-  ↓
-WebhookKafkaConsumer (operations-service)
-  → extracts merchantId, eventType from envelope
-  → calls MerchantWebhookApi.getActiveConfigForEvent() via Feign
-  → for each active config:
-      decrypt webhook secret (AES-256-GCM)
-      sign payload: HMAC-SHA256(payload, secret)
-      save WebhookEvent (status=PENDING, nextRetryAt=now)
-      enqueue to Redis ZSet (score = nextRetryAt epoch ms)
-  → manual ack
-  ↓
-WebhookDeliveryScheduler (runs every 1s)
-  → Redis ZSet rangeByScore(0, now, limit=100)
-  → removes due entries atomically
-  → dispatches each to virtual thread
-  ↓
-WebhookDeliverExecutor
-  → HTTP POST to merchant targetUrl
-  → on success: mark DELIVERED
-  → on failure: increment attempts, calculate next retry, re-enqueue
-    Retry schedule: 1min → 5min → 30min → 2hr → 8hr → 24hr (max 7 attempts)
-  ↓
-WebhookDlqRecorder (after max attempts)
-  → @Transactional(REQUIRES_NEW)
-  → mark WebhookEvent DEAD
-  → save DLQEvent with full payload + final error
+`common-lib` is a shared JAR. Beans register via Spring Boot AutoConfiguration — no manual wiring needed in services.
 
-DB Reconciler (runs every 10s)
-  → re-enqueues any PENDING events missed due to crash
-  → uses enqueueIfAbsent (no duplicates)
-```
-
----
-
-## Settlement Pipeline
-
-```
-SettlementEngine (@Scheduled cron: 0 0 23 * * *)
-  → MerchantLookupService.listActiveMerchantIds() via Feign
-  → for each merchantId → virtual thread:
-      ↓
-  SettlementTransactionExecutor.processForMerchant(merchantId, today)
-      → PaymentLookupService.findUnsettledCapturedPayments() via Feign
-        (@Lock PESSIMISTIC_WRITE — prevents double-settlement)
-      → calculate:
-          gross  = sum of payment amounts
-          fee    = gross × 2%
-          gst    = fee × 18%
-          net    = gross − fee − gst
-      → create Settlement (status=TRANSFER_PENDING)
-      → create SettlementPayment records per payment
-      → BankTransferProcessor.initiate() → returns TXN_ ref
-      ↓
-BankSettlementCallbackSimulator (@Scheduled 5s, for local testing)
-  → finds TRANSFER_PENDING settlements
-  → generates UTR number
-  → SettlementTransactionExecutor.resolveTransfer()
-      → mark Settlement COMPLETED
-      → PaymentLookupService.markSettled() via Feign
-          → sets settledAt on each payment in payment-service
-```
-
----
-
-## Common Library
-
-`common-lib` is a shared JAR included by all services. Beans are registered via Spring Boot AutoConfiguration — services get everything without manual wiring.
-
-**Auto-configurations registered in:**
-`META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`
-
-| Configuration Class | What it provides |
+| Configuration Class | Provides |
 |---|---|
-| `SharedAuditAutoConfiguration` | JPA auditing, `AuditorAwareImpl` (reads from MerchantContext) |
-| `SharedKafkaAutoConfiguration` | `KafkaProperties`, topic resolution by `EventAggregateType` |
-| `SharedResilienceAutoConfigurations` | `IdempotencyFilter`, rate limiting (fixed/sliding window/token bucket) |
+| `SharedAuditAutoConfiguration` | JPA auditing, `AuditorAwareImpl` |
+| `SharedKafkaAutoConfiguration` | `KafkaProperties`, topic resolution |
+| `SharedResilienceAutoConfigurations` | `IdempotencyFilter`, rate limiters (fixed window, sliding window, token bucket) |
 | `SharedExceptionAutoConfiguration` | `GlobalExceptionHandler`, structured error responses |
-| `SharedSecurityAutoConfiguration` | `JwtUtils`, `AesEncryptionConfig` (master key encryptor bean), `SignerUtil` |
+| `SharedSecurityAutoConfiguration` | `JwtUtils`, AES encryptor bean, `SignerUtil` |
 | `SharedWebFilterAutoConfiguration` | `MerchantContextFilter`, `RequestContextFilter` |
 
-Other shared components: `MerchantContext` (@RequestScope), `Money`, `BaseEntity`, all enums, Feign DTOs.
-
 ---
 
-## Database Schema — Key Design Choices
+## Database — Sensitive Column Storage
 
-**Sensitive columns:**
-
-| Column | Table | Storage |
+| Column | Table | How stored |
 |---|---|---|
-| `keySecretHash` | `ApiKey` | BCrypt hash — never reversible |
-| `previousKeySecretHash` | `ApiKey` | BCrypt hash — grace period rotation |
-| `encryptedPan` | `VaultCard` | AES-256-GCM encrypted |
-| `encryptedDek` | `VaultCard` | DEK encrypted by master key |
-| `webhookSecret` | `MerchantWebhookConfig` | AES-256-GCM encrypted |
-
-**Pessimistic locking queries:**
-- `OrderRepository.findByIdAndMerchantIdForUpdate` — prevents duplicate payments on same order
-- `PaymentRepository.findByIdAndMerchantIdForUpdate` — capture/refund safety
-- `PaymentRepository.findByMerchantIdAndStatusForUpdate` — settlement, prevents double-settlement
+| `keySecretHash` | `ApiKey` (merchant-db) | BCrypt — irreversible |
+| `previousKeySecretHash` | `ApiKey` (merchant-db) | BCrypt — grace period rotation |
+| `encryptedPan` | `VaultCard` (vault-db) | AES-256-GCM with per-card DEK |
+| `encryptedDek` | `VaultCard` (vault-db) | AES-256-GCM with master key |
+| `webhookSecret` | `MerchantWebhookConfig` (merchant-db) | AES-256-GCM — decrypted only at signing time |
