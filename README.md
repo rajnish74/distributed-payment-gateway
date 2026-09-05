@@ -12,9 +12,11 @@ Inspired by Razorpay's architecture — built from scratch to understand how rea
 [![Kafka](https://img.shields.io/badge/Kafka-KRaft-black?style=flat-square&logo=apachekafka)](https://kafka.apache.org)
 [![Redis](https://img.shields.io/badge/Redis-7-red?style=flat-square&logo=redis)](https://redis.io)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-blue?style=flat-square&logo=postgresql)](https://www.postgresql.org)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![Prometheus](https://img.shields.io/badge/Prometheus-metrics-E6522C?style=flat-square&logo=prometheus)](https://prometheus.io)
+[![Grafana](https://img.shields.io/badge/Grafana-dashboards-F46800?style=flat-square&logo=grafana)](https://grafana.com)
+[![Zipkin](https://img.shields.io/badge/Zipkin-tracing-FFA500?style=flat-square)](https://zipkin.io)
 
-[Getting Started](#getting-started) • [Architecture](#architecture) • [Services](#services) • [API Reference](docs/api-reference.md) • [Documentation](#documentation)
+[Getting Started](#getting-started) • [Architecture](#architecture) • [Services](#services) • [Observability](#observability) • [API Reference](docs/api-reference.md) • [Documentation](#documentation)
 
 </div>
 
@@ -25,6 +27,7 @@ Inspired by Razorpay's architecture — built from scratch to understand how rea
 This is the microservices rewrite of a [monolith payment gateway](https://github.com/rajnish74/Payment-Gateway-Integrations-System) I built earlier. The rewrite wasn't just architecture for architecture's sake — the settlement engine (nightly batch), webhook delivery (retry queue, async HTTP), and real-time payment processing have fundamentally different scaling and failure characteristics. Splitting them means they fail independently and scale independently.
 
 **What it implements:**
+
 - Complete payment lifecycle — merchant onboarding → order → payment → capture → settlement
 - 14-state payment state machine with immutable audit trail
 - PCI-DSS compliant card vault with AES-256-GCM envelope encryption
@@ -33,6 +36,7 @@ This is the microservices rewrite of a [monolith payment gateway](https://github
 - Nightly settlement engine with 2% fee + 18% GST calculation
 - Rate limiting (fixed window / sliding window / token bucket via Lua scripts)
 - Idempotency on all write endpoints via `X-Idempotency-Key`
+- Full observability — distributed tracing (Zipkin), metrics (Prometheus), dashboards (Grafana)
 
 ---
 
@@ -72,24 +76,25 @@ Client ────────────► API Gateway :8010
                      Rate limiter (Redis Lua)
                      Idempotency check (Redis)
                           │
-          ┌───────────────┼─────────────────┐
-          ▼               ▼                 ▼
-    merchant-svc     payment-svc       vault-svc
-      :9010            :9020            :9030
-                          │
-                    operations-svc
-                       :9040
-                    ┌────┴────┐
-                 webhook   settlement
-               (Redis ZSet) (nightly cron)
+          ┌───────────────┼──────────────┬────────────────┐
+          ▼               ▼              ▼                ▼
+    merchant-svc     payment-svc    vault-svc     operations-svc
+      :9010            :9020          :9030            :9040
+                          │                        ┌────┴────┐
+                    Outbox → Kafka            webhook     settlement
+                                           (Redis ZSet) (nightly cron)
+
+Observability (all services):
+  → Micrometer → Prometheus :9090 → Grafana :3000
+  → Spring Cloud Sleuth → Zipkin :9411
 ```
 
-**Synchronous communication (OpenFeign):**
+**Synchronous (OpenFeign):**
 ```
 api-gateway      → merchant-service    API key lookup
 payment-service  → vault-service       Card charge
 payment-service  → merchant-service    Customer findOrCreate
-operations-svc   → merchant-service    Webhook configs, merchant bank details
+operations-svc   → merchant-service    Webhook configs, bank details
 operations-svc   → payment-service     Unsettled payments, mark-settled
 ```
 
@@ -102,6 +107,52 @@ payment-service → Outbox → Kafka (payments / orders / refund / settlement ev
 
 ---
 
+## Observability
+
+Every service exposes metrics, traces, and logs. No manual instrumentation needed — Micrometer and Spring Cloud Sleuth wire everything automatically via `spring-boot-starter-actuator`.
+
+### Distributed Tracing — Zipkin
+
+Every request gets a `traceId` that follows it across service boundaries. Feign calls, Kafka messages, and DB queries are all captured.
+
+```
+http://localhost:9411
+```
+
+Find a payment by its ID → see the full trace:
+```
+API Gateway → payment-service → vault-service → Kafka → operations-service
+```
+
+### Metrics — Prometheus + Grafana
+
+Prometheus scrapes `/actuator/prometheus` from all 5 services every 5 seconds:
+
+| Service | Scrape target |
+|---|---|
+| api-gateway-service | `host.docker.internal:8010` |
+| merchant-service | `host.docker.internal:9010` |
+| payment-service | `host.docker.internal:9020` |
+| vault-service | `host.docker.internal:9030` |
+| operations-service | `host.docker.internal:9040` |
+
+**Grafana dashboards:** `http://localhost:3000` (admin/admin)
+
+Datasource is auto-provisioned — Prometheus is connected automatically on startup. Dashboards are loaded from `provisioning/dashboards/`.
+
+**Key metrics available:**
+- HTTP request rate, latency, error rate per service
+- JVM memory, GC, thread pool stats
+- Kafka consumer lag, publish rate
+- Custom payment metrics — payment initiation rate, capture rate, failure rate
+- Settlement processing time per merchant
+
+### Structured Logging
+
+All services use SLF4J with MDC — `traceId` and `spanId` are injected into every log line automatically. Correlate logs with Zipkin traces using the traceId.
+
+---
+
 ## Getting Started
 
 ### Prerequisites
@@ -110,31 +161,40 @@ payment-service → Outbox → Kafka (payments / orders / refund / settlement ev
 - Maven 3.9+
 - Docker + Docker Compose
 
-### Startup order matters
-
-Config server must be up before anything else. Eureka before business services. Gateway last.
+### 1. Start infrastructure + observability stack
 
 ```bash
-# 1. Start infrastructure
 docker compose up -d
+```
 
-# 2. Config server (wait for startup before next step)
+This starts: PostgreSQL, Redis, Kafka, Prometheus, Grafana, Zipkin.
+
+Verify:
+- Eureka: http://localhost:8761
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (admin/admin)
+- Zipkin: http://localhost:9411
+
+### 2. Start services in order
+
+```bash
+# Config server first
 cd config-service && mvn spring-boot:run
 
-# 3. Discovery server (wait for :8761 before next step)
+# Discovery server second
 cd discovery-service && mvn spring-boot:run
 
-# 4. Business services (any order)
+# Business services (any order)
 cd merchant-service    && mvn spring-boot:run
 cd payment-service     && mvn spring-boot:run
 cd vault-service       && mvn spring-boot:run
 cd operations-service  && mvn spring-boot:run
 
-# 5. Gateway (last)
+# Gateway last
 cd api-gateway-service && mvn spring-boot:run
 ```
 
-Verify at http://localhost:8761 — all 5 services should be registered in Eureka.
+All 5 services should appear in Eureka at http://localhost:8761 within 30 seconds.
 
 Full setup guide: [docs/local-setup.md](docs/local-setup.md)
 
@@ -153,13 +213,13 @@ curl -X POST http://localhost:8010/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email":"dev@acme.com","password":"secret123"}'
 
-# Create API key (use JWT from login)
+# Create API key
 curl -X POST http://localhost:8010/v1/merchants/api-keys \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"environment":"TEST"}'
 
-# Create order (use keyId:secret from above in Basic Auth)
+# Create order
 curl -X POST http://localhost:8010/v1/orders \
   -H "Authorization: Basic <base64(keyId:secret)>" \
   -H "Content-Type: application/json" \
@@ -172,21 +232,21 @@ curl -X POST http://localhost:8010/v1/payments \
   -d '{"orderId":"<orderId>","method":"UPI","methodDetails":{"VPA":"test@axis"}}'
 ```
 
-The bank callback simulator will automatically resolve the payment within a few seconds.
+The bank callback simulator resolves the payment automatically within a few seconds. Check Zipkin for the full trace.
 
 ---
 
 ## Key Design Decisions
 
-**Transactional Outbox** — events are saved in the same DB transaction as the business entity, published to Kafka asynchronously. Eliminates the dual-write problem — no events lost even if Kafka is temporarily unavailable.
+**Transactional Outbox** — events saved in the same DB transaction as the business entity, published to Kafka asynchronously. No events lost even if Kafka is temporarily unavailable.
 
-**Pessimistic locking** — concurrent payment requests on the same order both pass the status check without locking. Added `@Lock(PESSIMISTIC_WRITE)` on order/payment queries — first request locks the row, second waits and fails cleanly.
+**Pessimistic locking** — `@Lock(PESSIMISTIC_WRITE)` on order/payment queries prevents concurrent requests from creating duplicate payments on the same order.
 
-**AES-256-GCM envelope encryption** — each card gets its own randomly generated DEK. PAN is encrypted with the DEK. DEK is encrypted with the master key. Master key never touches the database. Raw PAN bytes are zeroed from JVM memory after use.
+**AES-256-GCM envelope encryption** — each card gets its own DEK. PAN encrypted with DEK, DEK encrypted with master key. Master key never touches the database. Raw PAN bytes zeroed from JVM memory after use.
 
-**Redis ZSet for webhook retry queue** — score is the epoch milliseconds of next retry time. `rangeByScore(0, now)` gives exactly what's due. DB reconciler re-enqueues anything missed on crash.
+**Redis ZSet for webhook retry queue** — score is epoch ms of next retry time. `rangeByScore(0, now)` gives exactly what's due. DB reconciler re-enqueues anything missed on crash.
 
-**Virtual threads** — both webhook delivery and settlement use `Executors.newVirtualThreadPerTaskExecutor()`. Both are I/O-bound workloads — waiting on HTTP responses and DB queries. No thread pool sizing needed.
+**Virtual threads** — webhook delivery and settlement both use `Executors.newVirtualThreadPerTaskExecutor()`. I/O-bound workloads — no thread pool sizing needed.
 
 Full reasoning: [docs/design-decisions.md](docs/design-decisions.md)
 
@@ -196,11 +256,12 @@ Full reasoning: [docs/design-decisions.md](docs/design-decisions.md)
 
 | | |
 |---|---|
-| [Architecture](docs/architecture.md) | System design, service map, request flows, Feign call graph |
+| [Architecture](docs/architecture.md) | System design, service map, request flows, Feign call graph, sequence diagrams |
 | [Payment Lifecycle](docs/payment-lifecycle.md) | All 14 state machine transitions, bank callback simulator |
-| [Security](docs/security.md) | Gateway auth, API key caching, rate limiting strategies, card encryption |
+| [Security](docs/security.md) | Gateway auth, API key caching, rate limiting, card encryption |
 | [Webhook Delivery](docs/webhook-delivery.md) | Kafka → Redis ZSet → virtual threads → exponential backoff → DLQ |
 | [Settlement](docs/settlement.md) | Nightly engine, fee calculation, bank transfer flow |
+| [Observability](docs/observability.md) | Zipkin tracing, Prometheus metrics, Grafana dashboards |
 | [Design Decisions](docs/design-decisions.md) | Why outbox pattern, pessimistic locking, virtual threads, separate DBs |
 | [API Reference](docs/api-reference.md) | All endpoints with request/response examples |
 | [Local Setup](docs/local-setup.md) | Running locally with Docker Compose |
@@ -209,9 +270,7 @@ Full reasoning: [docs/design-decisions.md](docs/design-decisions.md)
 
 ## Related
 
-**v1 — Monolith:** https://github.com/rajnish74/Payment-Gateway-Integrations-System
-
-The same domain built as a single Spring Boot application first. The monolith is complete and fully working. This repo is the microservices rewrite.
+**v1 — Monolith:** https://github.com/rajnish74/Payment-Gateway-Integrations-System — same domain, single deployable unit. Built first to understand the business logic before splitting into services.
 
 ---
 
